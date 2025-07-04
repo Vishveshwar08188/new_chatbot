@@ -5,3 +5,5 @@ faiss-cpu
 PyPDF2
 langchain
 accelerate
+uvicorn
+fastapi
