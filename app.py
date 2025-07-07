@@ -1,67 +1,69 @@
-from fastapi import FastAPI, Request
-from pydantic import BaseModel
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from sentence_transformers import SentenceTransformer
-import faiss
-import numpy as np
 import PyPDF2
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.vectorstores import Chroma
+from langchain.embeddings import HuggingFaceEmbeddings
+import gradio as gr
+import requests
 import os
 
-app = FastAPI()
+# 🔐 Read API key from env
+HF_API_KEY = os.getenv("HF_API_KEY")
+HF_MODEL = "google/flan-t5-base"
 
-# === Load model and embeddings ===
-model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-tokenizer = AutoTokenizer.from_pretrained(model_id)
-model = AutoModelForCausalLM.from_pretrained(model_id, device_map="auto")
-generator = pipeline("text-generation", model=model, tokenizer=tokenizer)
+pdf_path = "your_file.pdf"  # Change this to your PDF file name
 
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
+def extract_text_from_pdf(path):
+    reader = PyPDF2.PdfReader(path)
+    text = ""
+    for page in reader.pages:
+        t = page.extract_text()
+        if t:
+            text += t
+    return text
 
-# === Load PDF and build FAISS ===
-def load_pdf_text(path="data.pdf"):
-    with open(path, "rb") as f:
-        reader = PyPDF2.PdfReader(f)
-        return "\n".join([p.extract_text() for p in reader.pages if p.extract_text()])
+raw_text = extract_text_from_pdf(pdf_path)
 
-text = load_pdf_text()
-splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-docs = splitter.split_text(text)
-doc_embeddings = embedder.encode(docs)
+splitter = CharacterTextSplitter(separator="\n", chunk_size=500, chunk_overlap=100)
+chunks = splitter.split_text(raw_text)
 
-dimension = doc_embeddings[0].shape[0]
-index = faiss.IndexFlatL2(dimension)
-index.add(np.array(doc_embeddings))
+embedding = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+db = Chroma.from_texts(chunks, embedding=embedding, persist_directory="./chroma_api_db")
 
-def retrieve_relevant_docs(query, k=3):
-    q_embedding = embedder.encode([query])
-    distances, indices = index.search(np.array(q_embedding), k)
-    return [docs[i] for i in indices[0]]
+def query_hf_api(prompt):
+    url = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
+    headers = {"Authorization": f"Bearer {HF_API_KEY}"}
+    data = {"inputs": prompt}
 
-# === API input format ===
-class QueryInput(BaseModel):
-    query: str
-    length: str = "short"
+    response = requests.post(url, headers=headers, json=data)
+    if response.status_code == 200:
+        output = response.json()
+        if isinstance(output, list) and "generated_text" in output[0]:
+            return output[0]["generated_text"]
+        elif "answer" in output:
+            return output["answer"]
+        else:
+            return output
+    else:
+        return f"[API Error] {response.status_code}: {response.text}"
 
-@app.post("/chat")
-def chat(input: QueryInput):
-    query = input.query
-    length = input.length
+def answer_question(user_input):
+    retriever = db.as_retriever()
+    docs = retriever.get_relevant_documents(user_input)
+    context = "\n".join([doc.page_content for doc in docs])
 
-    context_docs = retrieve_relevant_docs(query, k=3)
-    context = "\n\n".join(context_docs)
-
-    prompt = f"""<|system|>You are a helpful assistant.<|end|>
-<|user|>
+    prompt = f"""
 Context:
 {context}
 
-Question: {query}
-Give a {'short (1-2 sentence)' if length == 'short' else 'detailed (long paragraph)'} answer based only on the context above.
-<|end|>
-<|assistant|>"""
+Question: {user_input}
+"""
+    return query_hf_api(prompt)
 
-    output = generator(prompt, max_new_tokens=300 if length == "long" else 80,
-                       do_sample=True, temperature=0.7, top_p=0.9, return_full_text=False)
-    
-    return {"answer": output[0]["generated_text"].strip()}
+demo = gr.Interface(
+    fn=answer_question,
+    inputs=gr.Textbox(lines=2, placeholder="Ask your question..."),
+    outputs="text",
+    title="📘 RAG Chatbot with HF API",
+)
+
+demo.launch(share=True)
