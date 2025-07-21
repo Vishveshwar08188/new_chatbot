@@ -1,6 +1,10 @@
-gradio
 langchain
-chromadb
+faiss-cpu
+transformers
 sentence-transformers
-PyPDF2
-requests
+huggingface-hub
+gradio
+pypdf
+python-docx
+unstructured[pdf]
+torch
